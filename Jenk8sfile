@@ -1,152 +1,94 @@
-pipeline {
-    agent any
-    
-    tools{
-        jdk 'jdk17'
-        maven 'maven3'
-    }
-    
-    environment{
-        SCANNER_HOME= tool 'sonar-scanner'
-        PATH = "$PATH:/usr/local/bin/aws"
-    }
+#!/usr/bin/env groovy
 
-    stages {
-        stage('Git Checkout') {
-            steps {
-                git branch: 'main', credentialsId: 'git-cred', url: 'https://github.com/Sabag10x/k8s-poc.git'
-            }
-        }
-        
-        stage('Compile') {
-            steps {
-                sh 'mvn compile'
-            }
-        }
-        
-        stage('Unit - Test') {
-            steps {
-                sh 'mvn test'
+import com.ipsy.buddy.DeploymentConfig
+import com.ipsy.buddy.DeploymentInput
+import groovy.transform.Field
+
+node("slave && corretto17") {
+
+    def NODE_VERSION = "16.16.0"
+
+    List<String> ENV = [
+            "JAVA_HOME=${tool('java-17-amazon-corretto')}/amazon-corretto-17.0.11.9.1-linux-x64",
+            "PATH+NODE=${tool('nodejs-' + NODE_VERSION)}/bin"
+    ]
+
+    utils.sendExceptionToSlack {
+        dir('code') {
+            stage("Setup") {
+                echo "Prep for per-dir Jenkinsfile!"
+                deleteDir()
+                checkout(scm)
+                sh 'git clean -f -d'
             }
         }
 
-        stage('File System Scan') {
-            steps {
-                sh "trivy fs --format table -o trivy-fs-report.html ."
-            }
-        }        
-        
-        stage('Sonarqube - Scanner') {
-            steps {
-                withSonarQubeEnv('sonar'){
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.ProjectName=K8sPoc -Dsonar.ProjectKey=K8sPoc \
-                    -Dsonar.java.binaries=. '''
-                    
+        dir('code/api-service') {
+            withEnv(ENV) {
+                stage("Checkstyle") {
+                    if (!gradle.call("clean check")) {
+                      error "Tests failed!"
+                    }
+                    echo "Tests passed!"
                 }
-            }
-        }
-        
-        stage('Sonar-Quality-Gate') {
-            steps {
-                script{
-                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
-                }
-            }
-        }
-        
-        stage('Build') {
-            steps {
-                sh 'mvn clean install'
-            }
-        }
-        
-        stage('Store Artifacts in S3') {
-            steps {
-                script {
-                    withAWS(credentials: 's3-artifact', region: 'us-east-1') {
-                        sh 'aws s3 cp ./target/*.jar  s3://poc-artifacts-ipsy/Artifacts/'
+
+                // Running sonarqube analysis
+                stage('Sonarqube') {
+                    sonarqube.withSonarEnv(NODE_VERSION, env.JAVA_HOME) {
+                        gradle.call('sonarqube')
                     }
                 }
-            }
-        }    
-        
-        stage('Build & Tag Docker Image ') {
-            steps {
-                script{
-                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
-                            sh 'docker build -t sabag10x/k8-spoc:v2 .'
+
+                // Running sonarqube quality gate. This will pass/fail the pipeline based on quality conditions
+                if (jenkinsUtils.isPR()) {
+                    stage("Quality Gate") {
+                        sonarqube.withSonarEnv(NODE_VERSION, env.JAVA_HOME) {
+                            sonarqube.runQualityGate();
+                        }
                     }
                 }
             }
         }
-        
-        stage('Docker-Image-Scan') {
-            steps {
-                sh "trivy image --format table -o trivy-fs-report.html sabag10x/k8-spoc:latest"
-                
-            }
-        } 
-        
-        stage('Docker-Push Image') {
-            steps {
-                script{
-                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
-                            sh 'docker push sabag10x/k8-spoc:v2'
-                    }
-                }
-            }
-        }
-        
-        stage ('eks-deployment'){
-            steps {
-                withKubeCredentials(kubectlCredentials: [[caCertificate: '', clusterName: 'k8spoc', contextName: '', credentialsId: 'kube-id', namespace: 'webapps', serverUrl: 'https://B519352EA84C7E41F780ACAD7AEBF5E2.gr7.us-east-2.eks.amazonaws.com']]) {
-                        sh "kubectl apply -f deployment-service.yaml"
-                }
-            }
+
+        // Only deploy in manually triggered build branch or a deploy branch.
+        if (!isManualBuildAndBuildBranch() && !isDeployBranch()) {
+          echo "Not build branch and user build. Aborting..."
+          return
         }
 
-                stage('Verify the Deployment') {
-            steps {
-               withKubeCredentials(kubectlCredentials: [[caCertificate: '', clusterName: 'k8spoc', contextName: '', credentialsId: 'kube-id', namespace: 'webapps', serverUrl: 'https://B519352EA84C7E41F780ACAD7AEBF5E2.gr7.us-east-2.eks.amazonaws.com']]) {
-                        sh "kubectl get pods -n webapps"
-                        sh "kubectl get svc -n webapps"
-                }
+        def loadPath = env.CURRENT_DIR ? "code/${env.CURRENT_DIR}" : "code"
+
+        stage("Determine which deploy to run") {
+            if (BRANCH_NAME == "master") {
+                load "${loadPath}/Jenkinsfile_build"
+                utils.loadJenkinsFiles("${loadPath}/Jenkinsfile_prod_bfa")
+            } else if (BRANCH_NAME == "develop") {
+                load "${loadPath}/Jenkinsfile_build"
+                utils.loadJenkinsFiles("${loadPath}/Jenkinsfile_staging_bfa")
+            } else if (BRANCH_NAME.contains("build/")) {
+                load "${loadPath}/Jenkinsfile_build"
+            } else if (BRANCH_NAME.contains("testing/")) {
+                load "${loadPath}/Jenkinsfile_build"
+                utils.loadJenkinsFiles("${loadPath}/Jenkinsfile_staging_bfa")
+            } else if (BRANCH_NAME.contains("preprod/")) {
+                load "${loadPath}/Jenkinsfile_build"
+                utils.loadJenkinsFiles("${loadPath}/Jenkinsfile_pre-prod-1_ipsy")
+            }else if (BRANCH_NAME.contains("release/")) {
+                load "${loadPath}/Jenkinsfile_build"
+                utils.loadJenkinsFiles("${loadPath}/Jenkinsfile_prod_bfa")
+            } else {
+                echo "Skipping deploy for branch $BRANCH_NAME"
             }
-        }
-    }
-    post {
-    always {
-        script {
-            def jobName = env.JOB_NAME
-            def buildNumber = env.BUILD_NUMBER
-            def pipelineStatus = currentBuild.result ?: 'UNKNOWN'
-            def bannerColor = pipelineStatus.toUpperCase() == 'SUCCESS' ? 'green' : 'red'
-
-            def body = """
-                <html>
-                <body>
-                <div style="border: 4px solid ${bannerColor}; padding: 10px;">
-                <h2>${jobName} - Build ${buildNumber}</h2>
-                <div style="background-color: ${bannerColor}; padding: 10px;">
-                <h3 style="color: white;">Pipeline Status: ${pipelineStatus.toUpperCase()}</h3>
-                </div>
-                <p>Check the <a href="${BUILD_URL}">console output</a>.</p>
-                </div>
-                </body>
-                </html>
-            """
-
-            emailext (
-                subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
-                body: body,
-                to: 'sabareeswaran2023@gmail.com',
-                from: 'jenkins@example.com',
-                replyTo: 'jenkins@example.com',
-                mimeType: 'text/html',
-                attachmentsPattern: 'trivy-image-report.html'
-            )
         }
     }
 }
 
+// Returns true if this is a build branch and triggered by user-build
+def isManualBuildAndBuildBranch() {
+  return jenkinsUtils.isUserBuild() && (BRANCH_NAME.startsWith("build/") || BRANCH_NAME.startsWith("testing/") || BRANCH_NAME.startsWith("preprod/") || BRANCH_NAME.startsWith("release/"))
+}
+
+// Returns true if this branch is supposed to deploy and upload artifacts
+def isDeployBranch() {
+  return BRANCH_NAME == "master" || BRANCH_NAME == "develop"
 }
